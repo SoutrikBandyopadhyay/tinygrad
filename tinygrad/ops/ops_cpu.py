@@ -1,12 +1,35 @@
 import numpy as np
-from .tensor import Function
+from ..tensor import Function
+
+class CPUBuffer(np.ndarray):
+  def log(x):
+    return np.log(x)
+  def exp(x):
+    return np.exp(x)
+  def relu(x):
+    return np.maximum(x, 0)
+  def expand(x, shp):
+    return np.broadcast_to(x, shp)
+  def amax(x, *args, **kwargs):
+    return np.amax(x, *args, **kwargs)
+  def permute(x, order):
+    return x.transpose(order)
+  def type(x, tt):
+    return x.astype(tt)
+  def custompad(x, padding):
+    return np.pad(x, padding)
+  def toCPU(x):
+    return x
+  @staticmethod
+  def fromCPU(x):
+    return x
 
 # ************* unary ops *************
 
 class ReLU(Function):
   def forward(ctx, input):
     ctx.save_for_backward(input)
-    return np.maximum(input, 0)
+    return input.relu()
 
   def backward(ctx, grad_output):
     input, = ctx.saved_tensors
@@ -15,7 +38,7 @@ class ReLU(Function):
 class Log(Function):
   def forward(ctx, input):
     ctx.save_for_backward(input)
-    return np.log(input)
+    return input.log()
 
   def backward(ctx, grad_output):
     input, = ctx.saved_tensors
@@ -23,7 +46,7 @@ class Log(Function):
 
 class Exp(Function):
   def forward(ctx, input):
-    ret = np.exp(input)
+    ret = input.clip(-88, 88).exp()
     ctx.save_for_backward(ret)
     return ret
 
@@ -31,41 +54,38 @@ class Exp(Function):
     ret, = ctx.saved_tensors
     return grad_output * ret
 
-# ************* reduce ops *************
+# ************* reduce ops (with keepdims=True) *************
 
 class Sum(Function):
-  def forward(ctx, input, axis=None):
-    ctx.save_for_backward(input, axis)
-    return np.array([input.sum()]) if axis is None else input.sum(axis=axis)
+  def forward(ctx, input, axis):
+    ctx.save_for_backward(input.shape)
+    return input.sum(axis, keepdims=True)
 
   def backward(ctx, grad_output):
-    input, axis = ctx.saved_tensors
-    if isinstance(axis, int): axis = [axis]
-    shape = [1 if axis is None or i in axis else input.shape[i] for i in range(len(input.shape))]
-    return grad_output.reshape(shape) + np.zeros_like(input)
+    shape_input, = ctx.saved_tensors
+    return grad_output.expand(shape_input)
 
 class Max(Function):
-  def forward(ctx, inp, axis=None):
-    if isinstance(axis, int): axis = [axis]
-    ret = np.amax(inp, axis=None if axis is None else tuple(axis), keepdims=True)
+  def forward(ctx, inp, axis):
+    ret = inp.amax(axis=axis, keepdims=True)
     ctx.save_for_backward(inp, axis, ret)
-    if axis is not None:
-      ret = ret.reshape([inp.shape[i] for i in range(len(inp.shape)) if i not in axis])
     return ret
 
   def backward(ctx, grad_output):
     input, axis, ret = ctx.saved_tensors
-    shape = [1 if axis is None or i in axis else input.shape[i] for i in range(len(input.shape))]
-    ret2 = (input==ret.reshape(shape))
-    div = ret2.sum(axis=None if axis is None else tuple(axis), keepdims=True)
-    return ret2*grad_output.reshape(shape)/div
+    ret2 = (input==ret)
+    div = ret2.sum(axis=tuple(axis), keepdims=True)
+    return ret2*grad_output/div.type(input.dtype)
 
-# ************* binary ops *************
+# ************* binary ops (with broadcasting) *************
 
 def unbroadcast(out, in_sh):
   # adjoint operation to broadcast is sum. Need to sum all axis with 1 = in_sh[i] < out.shape[i]
-  sum_axis = tuple([i for i in range(len(in_sh)) if in_sh[i]==1 and out.shape[i]>1]) if in_sh != (1,) else None
-  return out.sum(axis=sum_axis).reshape(in_sh)
+  if in_sh == (1,):
+    return out.sum().reshape((1,))
+  else:
+    sum_axis = tuple([i for i in range(len(in_sh)) if in_sh[i]==1 and out.shape[i]>1])
+    return out.sum(axis=sum_axis).reshape(in_sh) if len(sum_axis) > 0 else out
 
 class Add(Function):
   def forward(ctx, x, y):
@@ -102,7 +122,7 @@ class Pow(Function):
   def backward(ctx, grad_output):
     x,y = ctx.saved_tensors
     return unbroadcast(y * (x**(y-1.0)) * grad_output, x.shape), \
-           unbroadcast((x**y) * np.log(x) * grad_output, y.shape)
+           unbroadcast((x**y) * x.log() * grad_output, y.shape)
 
 # ************* movement ops *************
 
@@ -118,14 +138,14 @@ class Reshape(Function):
 class Transpose(Function):
   def forward(ctx, x, order):
     ctx.save_for_backward(order)
-    return np.transpose(x, order)
+    return x.permute(order)
 
   def backward(ctx, x):
-    return np.transpose(x, np.argsort(ctx.order))
+    return x.permute(tuple(np.argsort(ctx.order)))
 
 def inner_slice(x, arg):
   padding = [(max(0, -p[0]), max(0, p[1]-x.shape[i])) for i,p in enumerate(arg)]
-  x = np.pad(x, padding)
+  x = x.custompad(padding)
   slicee = [(p[0] + padding[i][0], p[1] + padding[i][0]) for i,p in enumerate(arg)]
   return x[tuple([slice(x[0], x[1], None) for x in slicee])]
 
@@ -148,8 +168,8 @@ class Matmul(Function):
 
   def backward(ctx, grad_output):
     input, weight = ctx.saved_tensors
-    grad_input = grad_output @ np.swapaxes(weight, -2, -1)
-    grad_weight = np.swapaxes(input, -2, -1) @ grad_output
+    grad_input = grad_output @ weight.swapaxes(-2, -1)
+    grad_weight = input.swapaxes(-2, -1) @ grad_output
     return grad_input, grad_weight
 
 class Conv2D(Function):

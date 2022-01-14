@@ -6,7 +6,7 @@ import random
 from tinygrad.tensor import Device
 from extra.utils import get_parameters
 from extra.training import train, evaluate
-from extra.transformer import Transformer
+from models.transformer import Transformer
 from tinygrad.optim import Adam
 
 # dataset idea from https://github.com/karpathy/minGPT/blob/master/play_math.ipynb
@@ -27,7 +27,7 @@ def make_dataset():
 
 from tinygrad.optim import Adam
 if __name__ == "__main__":
-  model = Transformer(10, 6, 2, 128, 4)
+  model = Transformer(10, 6, 2, 128, 4, 32)
 
   X_train, Y_train, X_test, Y_test = make_dataset()
   lr = 0.003

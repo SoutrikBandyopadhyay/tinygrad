@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+#import faulthandler
+#faulthandler.enable()
+
 # RISK architecture is going to change everything
 
 # Arty A7-100T
@@ -38,6 +41,7 @@ from collections import defaultdict
 # <empty> <output> <input> <weight>
 # <weight> <input> <empty> <output>
 
+# TODO: delete slots, write malloc
 SZ = 32
 SLOTSIZE = 1024*1024*2   # 5MB, for 20MB total. 8M elements
 sram = np.zeros((SLOTSIZE*4), dtype=np.float32)
@@ -46,11 +50,11 @@ SLOT = lambda x: x*SLOTSIZE
 
 from enum import Enum
 class Reg(Enum):
-  ZERO = 0
   # can the ALU use the same registers?
   MATMUL_INPUT = 1
   MATMUL_WEIGHTS = 2
   MATMUL_OUTPUT = 3
+  MATMUL_ACC = 4
 
 # this should be a generic function with a LUT, similar to the ANE
 class UnaryOps(Enum):
@@ -66,6 +70,10 @@ class BinaryOps(Enum):
   DIV = 3
   MULACC = 4
   POW = 5
+
+class ReduceOps(Enum):
+  SUM = 0
+  MAX = 1
 
 for t in Reg:
   regfile[t] = np.zeros((SZ, SZ), dtype=np.float32)
@@ -86,7 +94,7 @@ def count(func):
 
 import atexit
 @atexit.register
-def risk_print_counts():
+def cherry_print_counts():
   print(cnts)
   print(tcnts)
   print(utils)
@@ -95,12 +103,12 @@ def risk_print_counts():
   print("%.2f GOPS %d maxdma" % ((tcnts['riski_matmul']*SZ*SZ*SZ*2 + tcnts['riski_mulacc']*SZ*SZ*2)*1e-9, maxdma))
   print("ran in %.2f us with util %.2f%% total %.2f us" % (sum(cnts.values())*1e-3, util_n*100/(util_d+1), sum(tcnts.values())*1e-3))
 
-def risk_reset_counts():
+def cherry_reset_counts():
   global cnts, utils
   cnts = defaultdict(int)
   utils = defaultdict(int)
 
-def risk_regdump():
+def cherry_regdump():
   print("\n***** regdump *****")
   print(regfile[Reg.MATMUL_INPUT])
   print(regfile[Reg.MATMUL_WEIGHTS])
@@ -128,8 +136,13 @@ def riski_sub():
   regfile[Reg.MATMUL_OUTPUT] = regfile[Reg.MATMUL_INPUT] - regfile[Reg.MATMUL_WEIGHTS]
 
 @count
-def riski_mul():
-  regfile[Reg.MATMUL_OUTPUT] = regfile[Reg.MATMUL_INPUT] * regfile[Reg.MATMUL_WEIGHTS]
+def riski_mul(sel=None):
+  if sel is not None:
+    # for broadcasting too
+    # TODO: put in other ops and work out transpose
+    regfile[Reg.MATMUL_OUTPUT] = regfile[Reg.MATMUL_INPUT][sel:sel+1].T * regfile[Reg.MATMUL_WEIGHTS]
+  else:
+    regfile[Reg.MATMUL_OUTPUT] = regfile[Reg.MATMUL_INPUT] * regfile[Reg.MATMUL_WEIGHTS]
 
 @count
 def riski_div():
@@ -137,11 +150,27 @@ def riski_div():
 
 @count
 def riski_mulacc():
-  regfile[Reg.MATMUL_OUTPUT] += regfile[Reg.MATMUL_INPUT] * regfile[Reg.MATMUL_WEIGHTS]
+  # riski_mul / MATMUL_ACC += Reg.MATMUL_OUTPUT
+  regfile[Reg.MATMUL_ACC] += regfile[Reg.MATMUL_INPUT] * regfile[Reg.MATMUL_WEIGHTS]
 
 @count
 def riski_pow():
   regfile[Reg.MATMUL_OUTPUT] = regfile[Reg.MATMUL_INPUT] ** regfile[Reg.MATMUL_WEIGHTS]
+
+@count
+def riski_reduce_sum(cnt=SZ, tgt=0, acc=False):
+  # TODO: use acc in reducer
+  if acc:
+    regfile[Reg.MATMUL_ACC][tgt] += regfile[Reg.MATMUL_OUTPUT][0:cnt].sum(axis=0)
+  else:
+    regfile[Reg.MATMUL_ACC][tgt] = regfile[Reg.MATMUL_OUTPUT][0:cnt].sum(axis=0)
+
+@count
+def riski_reduce_max(cnt=SZ, tgt=0, acc=False):
+  if acc:
+    regfile[Reg.MATMUL_ACC][tgt] = np.concatenate([regfile[Reg.MATMUL_OUTPUT][0:cnt], regfile[Reg.MATMUL_ACC][tgt]], axis=0).max(axis=0)
+  else:
+    regfile[Reg.MATMUL_ACC][tgt] = regfile[Reg.MATMUL_OUTPUT][0:cnt].max(axis=0)
 
 # TODO: make accumulate a bit in the instruction available to all
 binops = {BinaryOps.ADD: riski_add,
@@ -151,29 +180,48 @@ binops = {BinaryOps.ADD: riski_add,
           BinaryOps.MULACC: riski_mulacc,
           BinaryOps.POW: riski_pow}
 
+reduceops = {ReduceOps.SUM: riski_reduce_sum,
+             ReduceOps.MAX: riski_reduce_max}
+
+SLOW_MATMUL = os.getenv("SLOW_MATMUL", False)
 @count
-def riski_matmul():
+def riski_matmul(slow=SLOW_MATMUL):
   #print("LLL:\n",regfile[Reg.MATMUL_INPUT],"\n",regfile[Reg.MATMUL_WEIGHTS])
-  regfile[Reg.MATMUL_OUTPUT] += \
-    regfile[Reg.MATMUL_INPUT] @ \
-    regfile[Reg.MATMUL_WEIGHTS]
+  if not slow:
+    regfile[Reg.MATMUL_ACC] += \
+      regfile[Reg.MATMUL_INPUT] @ \
+      regfile[Reg.MATMUL_WEIGHTS]
+  else:
+    for l in range(0, SZ):
+      riski_mul(l)
+      riski_reduce_sum(tgt=l, acc=True)
 
 @count
 def riski_mov(tout, tin):
-  regfile[tout][:] = regfile[tin]
+  ret = regfile[tin]
+  regfile[tout] = np.copy(ret)
+
+@count
+def riski_zero(tout):
+  regfile[tout][:, :] = 0
 
 load_log = open("/tmp/risk_load_log", "w") if os.getenv("LOAD_LOG") else None
 
 @count
-def riski_load(target, address, stride_y=SZ, stride_x=1, len_y=SZ, len_x=SZ):
+def riski_load(target, address, stride_y=SZ, stride_x=1, len_y=SZ, len_x=SZ, zero=True, skip_first=False):
   global util_n, util_d
   if load_log is not None:
-    load_log.write("%d %d %d\n" % (address, stride_y, stride_x))
+    load_log.write("%d %d %d %d %d\n" % (address, stride_y, stride_x, len_y, len_x))
   utils[(len_y, len_x)] += 1
   stride_y, stride_x = int(stride_y), int(stride_x)
+  assert (address + stride_y*(len_y-1) + stride_x*(len_x-1)) < sram.shape[0]
   d = regfile[target]
-  d[:] = 0
-  d[:len_y, :len_x] = np.lib.stride_tricks.as_strided(sram[address:], (len_y, len_x), (stride_y*4, stride_x*4))
+  if zero:
+    d[:] = 0
+  if skip_first:
+    d[1:(len_y+1), :len_x] = np.lib.stride_tricks.as_strided(sram[address:], (len_y, len_x), (stride_y*4, stride_x*4))
+  else:
+    d[:len_y, :len_x] = np.lib.stride_tricks.as_strided(sram[address:], (len_y, len_x), (stride_y*4, stride_x*4))
   """
   for y in range(0, len_y):
     for x in range(0, len_x):
@@ -183,6 +231,7 @@ def riski_load(target, address, stride_y=SZ, stride_x=1, len_y=SZ, len_x=SZ):
 @count
 def riski_store(target, address, stride_y=SZ, stride_x=1, len_y=SZ, len_x=SZ):
   stride_y, stride_x = int(stride_y), int(stride_x)
+  assert (address + stride_y*(len_y-1) + stride_x*(len_x-1)) < sram.shape[0]
   d = regfile[target]
   np.lib.stride_tricks.as_strided(sram[address:], (len_y, len_x), (stride_y*4, stride_x*4))[:, :] = d[:len_y, :len_x]
   """
@@ -191,32 +240,137 @@ def riski_store(target, address, stride_y=SZ, stride_x=1, len_y=SZ, len_x=SZ):
       sram[address + y*stride_y + x*stride_x] = d[y, x]
   """
 
+# *** DMA engine ***
+
 @count
-def riski_dmar(address, arr):
+def cherry_dmar(address, arr):
   global maxdma
   arr = arr.reshape(-1)
   assert(arr.shape[0] <= SLOTSIZE)
   maxdma = max(maxdma, arr.shape[0])
-  print("DMAR %d elements" % arr.shape[0])
+  #print("DMAR %d elements" % arr.shape[0])
   sram[address:address+arr.shape[0]] = arr
 
 @count
-def riski_dmaw(address, shp):
-  print("DMAW %d elements" % np.prod(shp))
+def cherry_dmaw(address, shp):
+  assert(np.prod(shp) <= SLOTSIZE)
+  #print("DMAW %d elements" % np.prod(shp))
   return np.copy(sram[address:address+np.prod(shp)].reshape(shp))
 
-# *** RISK-5 code to be compiled ***
+# *** CHERRY code to be compiled ***
 
-def risk_unop(x, op):
-  riski_dmar(SLOT(0), x)
+def cherry_reduceop(inp, op, axis, keepdims=False):
+  dimlist, redlist = [], []
+  if type(axis) == int:
+    axis = [axis]
+  if axis is None:
+    # full reduce
+    #osize = [1]*len(inp.shape)
+    osize = [1]
+    dimlist = [np.prod(inp.shape), 1]
+    redlist = [True, False]
+    #dimlist = [1, np.prod(inp.shape)]
+    #redlist = [False, True]
+  else:
+    osize = np.array(inp.shape)
+    osize[list(axis)] = 1
+
+    # skip any early 1s
+    sd = 0
+    while sd < len(osize) and osize[sd] == 1 and inp.shape[sd] == 1:
+      sd += 1
+
+    # this would be good in the GPU
+    for i in range(sd, len(inp.shape)):
+      is_reduce_axis = osize[i] == 1 and inp.shape[i] != -1
+      if len(dimlist) == 0:
+        dimlist.append(inp.shape[i])
+        redlist.append(is_reduce_axis)
+      else:
+        if redlist[-1] == is_reduce_axis:
+          dimlist[-1] *= inp.shape[i]
+        else:
+          dimlist.append(inp.shape[i])
+          redlist.append(is_reduce_axis)
+
+    if not keepdims:
+      nosize = []
+      for i in range(osize.shape[0]):
+        if i not in axis:
+          nosize.append(osize[i])
+      osize = nosize
+
+  osize = tuple(osize)
+  #print("reduce", op, inp.shape, axis, "->", osize, dimlist, redlist)
+  inslot, outslot = 0, 2
+  cherry_dmar(SLOT(inslot), inp)
+
+  # dimlist is always the inshape
+  # redlist is always [False, True, False, True, ...., True, False]
+
+  # special case if redlist ends with True
+  if len(redlist) > 0 and redlist[-1] == True:
+    #print("special case redlist[-1] == True")
+    outside = int(np.prod(dimlist[:-1]))
+    for l in range(0, outside, SZ):
+      reduce_size = min(SZ, outside-l)
+      j = 0
+      while j < dimlist[-1]:
+        len_y = min(SZ if j == 0 else SZ-1, dimlist[-1]-j)
+        riski_load(Reg.MATMUL_OUTPUT,
+          SLOT(inslot) + l*dimlist[-1] + j,
+          stride_y=1, stride_x=dimlist[-1],
+          len_y=len_y,
+          len_x=reduce_size,
+          zero=j==0, skip_first=j!=0)
+        reduceops[op](len_y+(j!=0))
+        riski_mov(Reg.MATMUL_OUTPUT, Reg.MATMUL_ACC)  # move the first row
+        j += SZ if j == 0 else SZ-1
+      riski_store(Reg.MATMUL_ACC, SLOT(outslot) + l, len_y=1, len_x=reduce_size)
+    # remove last dimension
+    redlist = redlist[:-1]
+    dimlist = dimlist[:-1]
+    inslot, outslot = outslot, inslot
+
+  # do the reduce merges one at a time
+  while len(dimlist) >= 2:
+    #print("proc", dimlist, redlist)
+
+    for l in range(0, int(np.prod(dimlist[:-2]))):
+      for k in range(0, dimlist[-1], SZ):
+        reduce_size = min(SZ, dimlist[-1]-k)
+        j = 0
+        while j < dimlist[-2]:
+          len_y = min(SZ if j == 0 else SZ-1, dimlist[-2]-j)
+          riski_load(Reg.MATMUL_OUTPUT,
+            SLOT(inslot) + l*dimlist[-2]*dimlist[-1] + j*dimlist[-1] + k,
+            stride_y=dimlist[-1], stride_x=1,
+            len_y=len_y,
+            len_x=reduce_size,
+            zero=j==0, skip_first=j!=0)
+          #cherry_regdump()
+          reduceops[op](len_y+(j!=0))
+          riski_mov(Reg.MATMUL_OUTPUT, Reg.MATMUL_ACC)  # move the first row
+          j += SZ if j == 0 else SZ-1
+        riski_store(Reg.MATMUL_ACC, SLOT(outslot) + l*dimlist[-1] + k, len_y=1, len_x=reduce_size)
+    inslot, outslot = outslot, inslot
+    if len(dimlist) <= 2:
+      break
+    # merge [False, True] into [False]
+    dimlist = dimlist[:-3] + [dimlist[-3]*dimlist[-1]]
+
+  return cherry_dmaw(SLOT(inslot), osize)
+
+def cherry_unop(x, op):
+  cherry_dmar(SLOT(0), x)
   cnt = np.prod(x.shape)
   for i in range(0, np.prod(x.shape), SZ*SZ):
     riski_load(Reg.MATMUL_INPUT, SLOT(0)+i)
     riski_unop(op)
     riski_store(Reg.MATMUL_OUTPUT, SLOT(2)+i)
-  return riski_dmaw(SLOT(2), x.shape)
+  return cherry_dmaw(SLOT(2), x.shape)
 
-def risk_binop(x, y, op):
+def cherry_binop(x, y, op):
   n_dims = max(len(x.shape), len(y.shape))
   shape_x, shape_y = np.ones(n_dims, dtype=np.int32), np.ones(n_dims, dtype=np.int32)
   shape_x[:len(x.shape)] = np.array(x.shape, dtype=np.int32)
@@ -224,7 +378,7 @@ def risk_binop(x, y, op):
   if not np.all((shape_x == 1) | (shape_y == 1) | (shape_x == shape_y)):
     raise Exception(f"binary op unbroadcastable shape mismatch: {x.shape} vs {y.shape}")
   shape_ret = np.maximum(shape_x, shape_y)
-  print(shape_x, shape_y, shape_ret)
+  #print(shape_x, shape_y, shape_ret)
 
   dimlist, complist = [], [] # note: len(dimlist) may be less than n_dims
   def push(dim, comp):
@@ -235,10 +389,10 @@ def risk_binop(x, y, op):
   for i in range(n_dims): # group together any adjacent dimensions that we can to simplify broadcasting
     push(max(shape_x[i], shape_y[i]), (shape_x[i] > 1, shape_y[i] > 1))
 
-  print(dimlist, complist)
+  #print(dimlist, complist)
 
-  riski_dmar(SLOT(0), x)
-  riski_dmar(SLOT(1), y)
+  cherry_dmar(SLOT(0), x)
+  cherry_dmar(SLOT(1), y)
   if len(dimlist) <= 1:
     if len(complist) == 0:
       complist = [(True, True)]
@@ -291,15 +445,15 @@ def risk_binop(x, y, op):
             stride_y=dimlist[-1], stride_x=1,
             len_y=min(SZ, dimlist[-2]-j), len_x=min(SZ, dimlist[-1]-k))
 
-  return riski_dmaw(SLOT(2), shape_ret)
+  return cherry_dmaw(SLOT(2), shape_ret)
 
-def risk_matmul(x, w, transpose_x=False, transpose_w=False):
+def cherry_matmul(x, w, transpose_x=False, transpose_w=False):
   # copy matrices into SRAM
   # x is M x K
   # w is K x N
   # out is M x N
-  riski_dmar(SLOT(0), x)
-  riski_dmar(SLOT(1), w)
+  cherry_dmar(SLOT(0), x)
+  cherry_dmar(SLOT(1), w)
 
   if transpose_x:
     K,M = x.shape[-2], x.shape[-1]
@@ -317,7 +471,7 @@ def risk_matmul(x, w, transpose_x=False, transpose_w=False):
   for c in range(cnt):
     for m in range(0, M, SZ):
       for n in range(0, N, SZ):
-        riski_mov(Reg.MATMUL_OUTPUT, Reg.ZERO)
+        riski_zero(Reg.MATMUL_ACC)
         for k in range(0, K, SZ):
           if transpose_x:
             riski_load(Reg.MATMUL_INPUT, SLOT(0)+c*M*K + k*M+m, 1, M, min(SZ, M-m), min(SZ, K-k))
@@ -328,45 +482,57 @@ def risk_matmul(x, w, transpose_x=False, transpose_w=False):
           else:
             riski_load(Reg.MATMUL_WEIGHTS, SLOT(1)+c*K*N + k*N+n, N, 1, min(SZ, K-k), min(SZ, N-n))
           riski_matmul()
-        riski_store(Reg.MATMUL_OUTPUT, SLOT(2)+c*M*N + m*N+n, N, 1, min(SZ, M-m), min(SZ, N-n))
+        riski_store(Reg.MATMUL_ACC, SLOT(2)+c*M*N + m*N+n, N, 1, min(SZ, M-m), min(SZ, N-n))
 
   # copy back from SRAM
-  return riski_dmaw(SLOT(2), (*x.shape[0:-2],M,N))
+  return cherry_dmaw(SLOT(2), (*x.shape[0:-2],M,N))
 
 import unittest
-class TestRisk(unittest.TestCase):
+class TestCherry(unittest.TestCase):
   def test_matmul_even(self):
     x = np.random.uniform(size=(SZ*8, SZ*8)).astype(np.float32)
     w = np.random.uniform(size=(SZ*8, SZ*8)).astype(np.float32)
-    np.testing.assert_allclose(x @ w, risk_matmul(x, w), rtol=1e-5)
+    np.testing.assert_allclose(x @ w, cherry_matmul(x, w), rtol=1e-5)
 
   def test_matmul_small(self):
     x = np.array([[1,2,3],[4,5,6],[7,8,9]])
     w = np.array([[-1,-2,-3],[-4,-5,-6],[-7,-8,-9]])
-    np.testing.assert_allclose(x @ w, risk_matmul(x, w), rtol=1e-5)
+    np.testing.assert_allclose(x @ w, cherry_matmul(x, w), rtol=1e-5)
 
   def test_matmul_uneven(self):
     x = np.random.uniform(size=(47, 79)).astype(np.float32)
     w = np.random.uniform(size=(79, 42)).astype(np.float32)
-    np.testing.assert_allclose(x @ w, risk_matmul(x, w), rtol=1e-5)
+    np.testing.assert_allclose(x @ w, cherry_matmul(x, w), rtol=1e-5)
 
   def test_matmul_transpose(self):
     x = np.random.uniform(size=(33, 33)).astype(np.float32)
     w = np.random.uniform(size=(33, 33)).astype(np.float32)
-    np.testing.assert_allclose(x @ w, risk_matmul(x, w), rtol=1e-5)
-    np.testing.assert_allclose(x.T @ w, risk_matmul(x, w, True), rtol=1e-5)
-    np.testing.assert_allclose(x @ w.T, risk_matmul(x, w, False, True), rtol=1e-5)
-    np.testing.assert_allclose(x.T @ w.T, risk_matmul(x, w, True, True), rtol=1e-5)
+    np.testing.assert_allclose(x @ w, cherry_matmul(x, w), rtol=1e-5)
+    np.testing.assert_allclose(x.T @ w, cherry_matmul(x, w, True), rtol=1e-5)
+    np.testing.assert_allclose(x @ w.T, cherry_matmul(x, w, False, True), rtol=1e-5)
+    np.testing.assert_allclose(x.T @ w.T, cherry_matmul(x, w, True, True), rtol=1e-5)
 
   def test_matmul_transpose_uneven_w(self):
     x = np.random.uniform(size=(47, 79)).astype(np.float32)
     w = np.random.uniform(size=(42, 79)).astype(np.float32)
-    np.testing.assert_allclose(x @ w.T, risk_matmul(x, w, transpose_w=True), rtol=1e-5)
+    np.testing.assert_allclose(x @ w.T, cherry_matmul(x, w, transpose_w=True), rtol=1e-5)
 
   def test_matmul_transpose_uneven_x(self):
     x = np.random.uniform(size=(79, 47)).astype(np.float32)
     w = np.random.uniform(size=(79, 42)).astype(np.float32)
-    np.testing.assert_allclose(x.T @ w, risk_matmul(x, w, transpose_x=True), rtol=1e-5)
+    np.testing.assert_allclose(x.T @ w, cherry_matmul(x, w, transpose_x=True), rtol=1e-5)
+
+  def test_mulacc_matmul(self):
+    regfile[Reg.MATMUL_INPUT] = np.arange(1, SZ*SZ+1).reshape((SZ, SZ))
+    regfile[Reg.MATMUL_WEIGHTS] = np.arange(1, SZ*SZ+1).reshape((SZ, SZ))*-1
+    riski_zero(Reg.MATMUL_ACC)
+    riski_matmul()
+    tst1 = np.copy(regfile[Reg.MATMUL_ACC])
+    riski_zero(Reg.MATMUL_ACC)
+    riski_matmul(True)
+    tst2 = np.copy(regfile[Reg.MATMUL_ACC])
+    np.testing.assert_allclose(tst1, tst2)
+
 
 if __name__ == "__main__":
   np.random.seed(1337)

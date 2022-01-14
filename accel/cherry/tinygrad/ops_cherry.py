@@ -1,48 +1,80 @@
 import numpy as np
 from tinygrad.tensor import Function
-from extra.risk import *
+from extra.cherry import *
 
 # ************* unary ops *************
 
 class ReLU(Function):
   def forward(ctx, input):
     ctx.save_for_backward(input)
-    return risk_unop(input, UnaryOps.RELU)
+    return cherry_unop(input, UnaryOps.RELU)
 
   def backward(ctx, grad_output):
     input, = ctx.saved_tensors
-    return risk_binop(grad_output, risk_unop(input, UnaryOps.GT0), BinaryOps.MUL)
+    return cherry_binop(grad_output, cherry_unop(input, UnaryOps.GT0), BinaryOps.MUL)
 
 class Log(Function):
   def forward(ctx, input):
     ctx.save_for_backward(input)
-    return risk_unop(input, UnaryOps.LOG)
+    return cherry_unop(input, UnaryOps.LOG)
 
   def backward(ctx, grad_output):
     input, = ctx.saved_tensors
-    return risk_binop(grad_output, input, BinaryOps.DIV)
+    return cherry_binop(grad_output, input, BinaryOps.DIV)
 
 class Exp(Function):
   def forward(ctx, input):
-    ret = risk_unop(input, UnaryOps.EXP)
+    ret = cherry_unop(input, UnaryOps.EXP)
     ctx.save_for_backward(ret)
     return ret
 
   def backward(ctx, grad_output):
     ret, = ctx.saved_tensors
-    return risk_binop(grad_output, ret, BinaryOps.MUL)
+    return cherry_binop(grad_output, ret, BinaryOps.MUL)
+
+# ************* reduce ops *************
+
+class Sum(Function):
+  def forward(ctx, input, axis=None):
+    ctx.save_for_backward(input, axis)
+    return cherry_reduceop(input, ReduceOps.SUM, axis)
+
+  def backward(ctx, grad_output):
+    input, axis = ctx.saved_tensors
+    if isinstance(axis, int): axis = [axis]
+    shape = [1 if axis is None or i in axis else input.shape[i] for i in range(len(input.shape))]
+    return cherry_binop(grad_output.reshape(shape), np.zeros_like(input), BinaryOps.ADD)
+
+class Max(Function):
+  def forward(ctx, inp, axis=None):
+    if isinstance(axis, int): axis = [axis]
+    #ret = np.amax(inp, axis=None if axis is None else tuple(axis), keepdims=True)
+    ret = cherry_reduceop(inp, ReduceOps.MAX, None if axis is None else tuple(axis), keepdims=True)
+    ctx.save_for_backward(inp, axis, ret)
+    if axis is not None:
+      ret = ret.reshape([inp.shape[i] for i in range(len(inp.shape)) if i not in axis])
+    return ret
+
+  def backward(ctx, grad_output):
+    input, axis, ret = ctx.saved_tensors
+    shape = [1 if axis is None or i in axis else input.shape[i] for i in range(len(input.shape))]
+    ret2 = (input==ret.reshape(shape))
+    #div = ret2.sum(axis=None if axis is None else tuple(axis), keepdims=True)
+    #return ret2*grad_output.reshape(shape)/div
+    div = cherry_reduceop(ret2, ReduceOps.SUM, axis=None if axis is None else tuple(axis), keepdims=True)
+    return cherry_binop(cherry_binop(ret2, grad_output.reshape(shape), BinaryOps.MUL), div, BinaryOps.DIV)
 
 # ************* binary ops *************
 
 def unbroadcast(out, in_sh):
   # adjoint operation to broadcast is sum. Need to sum all axis with 1 = in_sh[i] < out.shape[i]
   sum_axis = tuple([i for i in range(len(in_sh)) if in_sh[i]==1 and out.shape[i]>1]) if in_sh != (1,) else None
-  return out.sum(axis=sum_axis).reshape(in_sh)
+  return cherry_reduceop(out, ReduceOps.SUM, sum_axis).reshape(in_sh)
 
 class Add(Function):
   def forward(ctx, x, y):
     ctx.save_for_backward(x.shape, y.shape)
-    return risk_binop(x, y, BinaryOps.ADD)
+    return cherry_binop(x, y, BinaryOps.ADD)
 
   def backward(ctx, grad_output):
     shape_x, shape_y = ctx.saved_tensors
@@ -51,7 +83,7 @@ class Add(Function):
 class Sub(Function):
   def forward(ctx, x, y):
     ctx.save_for_backward(x.shape, y.shape)
-    return risk_binop(x, y, BinaryOps.SUB)
+    return cherry_binop(x, y, BinaryOps.SUB)
 
   def backward(ctx, grad_output):
     shape_x, shape_y = ctx.saved_tensors
@@ -60,7 +92,7 @@ class Sub(Function):
 class Mul(Function):
   def forward(ctx, x, y):
     ctx.save_for_backward(x, y)
-    return risk_binop(x, y, BinaryOps.MUL)
+    return cherry_binop(x, y, BinaryOps.MUL)
 
   def backward(ctx, grad_output):
     x,y = ctx.saved_tensors
@@ -69,7 +101,7 @@ class Mul(Function):
 class Pow(Function):
   def forward(ctx, x, y):
     ctx.save_for_backward(x, y)
-    return risk_binop(x, y, BinaryOps.POW)
+    return cherry_binop(x, y, BinaryOps.POW)
 
   def backward(ctx, grad_output):
     x,y = ctx.saved_tensors
@@ -81,12 +113,12 @@ class Pow(Function):
 class Matmul(Function):
   def forward(ctx, input, weight):
     ctx.save_for_backward(input, weight)
-    return risk_matmul(input, weight)
+    return cherry_matmul(input, weight)
 
   def backward(ctx, grad_output):
     input, weight = ctx.saved_tensors
-    grad_input = risk_matmul(grad_output, weight, transpose_w=True)
-    grad_weight = risk_matmul(input, grad_output, transpose_x=True)
+    grad_input = cherry_matmul(grad_output, weight, transpose_w=True)
+    grad_weight = cherry_matmul(input, grad_output, transpose_x=True)
     return grad_input, grad_weight
 
 class Conv2D(Function):
@@ -125,10 +157,10 @@ class Conv2D(Function):
     return np.moveaxis(ret,4,2).reshape(bs, cout, oy, ox)
     """
 
-    riski_dmar(SLOT(0), x)   # bs, groups, cin, x.shape[2], x.shape[3]
-    riski_dmar(SLOT(1), w)   # groups, rcout, cin, H, W
+    cherry_dmar(SLOT(0), x)   # bs, groups, cin, x.shape[2], x.shape[3]
+    cherry_dmar(SLOT(1), w)   # groups, rcout, cin, H, W
 
-    risk_reset_counts()
+    cherry_reset_counts()
     print(bs, ctx.groups, rcout, oy, ox, cin, H, W)
 
     for B in range(0, bs):
@@ -144,7 +176,7 @@ class Conv2D(Function):
         #    bs x groups x yx -- groups x 1 --> bs x groups x yx
         #    it looks like a broadcasted multiply
 
-        print("opt1")
+        #print("opt1")
 
         # x:   bs x groups x iy x ix
         # w:        groups x H  x W
@@ -154,7 +186,7 @@ class Conv2D(Function):
           for Y in range(0, oy):
             for X in range(0, ox, SZ):
               IY,IX = Y*ys,X*xs
-              riski_mov(Reg.MATMUL_OUTPUT, Reg.ZERO)
+              riski_zero(Reg.MATMUL_ACC)
               for y in range(IY, IY+H):
                 for x in range(IX, IX+W):
                   riski_load(Reg.MATMUL_INPUT,
@@ -166,12 +198,12 @@ class Conv2D(Function):
                     0, H*W, SZ, min(SZ, groups-g))
                   riski_mulacc()
                   #risk_regdump()
-              riski_store(Reg.MATMUL_OUTPUT,
+              riski_store(Reg.MATMUL_ACC,
                 SLOT(2) + B*groups*oy*ox + g*oy*ox + Y*ox + X,
                 1, oy*ox, min(SZ, ox-X), min(SZ, groups-g))
 
       elif H == 1 and W == 1 and xs == 1 and ys == 1:
-        print("opt2")
+        #print("opt2")
         # oxy x cin x rcout -- unstrided 1x1
         # this is a simple matmul
         for g in range(0, groups):
@@ -180,7 +212,7 @@ class Conv2D(Function):
             assert yx == iy*ix
             for YX in range(0, oy*ox, SZ):   # these are next to each other
               # inner conv
-              riski_mov(Reg.MATMUL_OUTPUT, Reg.ZERO)
+              riski_zero(Reg.MATMUL_ACC)
               for ci in range(0, cin, SZ):
                 riski_load(Reg.MATMUL_INPUT,
                   SLOT(0) + B*groups*cin*yx + g*cin*yx + ci*yx + YX,
@@ -189,11 +221,11 @@ class Conv2D(Function):
                   SLOT(1) + g*rcout*cin + c*cin + ci,
                   1, cin, min(SZ, cin-ci), min(SZ, rcout-c))
                 riski_matmul()
-              riski_store(Reg.MATMUL_OUTPUT,
+              riski_store(Reg.MATMUL_ACC,
                 SLOT(2) + B*groups*rcout*yx + g*rcout*yx + c*yx + YX,
                 1, yx, min(SZ, yx-YX), min(SZ, rcout-c))
       else:
-        print("unoptimized")
+        #print("unoptimized")
         # ox x cin x rcout -- unoptimized
         for g in range(0, groups):
           for c in range(0, rcout, SZ):
@@ -202,7 +234,7 @@ class Conv2D(Function):
                 IY,IX = Y*ys,X*xs
 
                 # inner conv
-                riski_mov(Reg.MATMUL_OUTPUT, Reg.ZERO)
+                riski_zero(Reg.MATMUL_ACC)
                 for ci in range(0, cin, SZ):
                   # not a loop in 1x1 convs, 9 in 3x3, 25 in 5x5
                   for y in range(IY, IY+H):
@@ -214,13 +246,13 @@ class Conv2D(Function):
                         SLOT(1) + g*rcout*cin*H*W + c*cin*H*W + ci*H*W + (y-IY)*W + (x-IX),
                         H*W, cin*H*W, min(SZ, cin-ci), min(SZ, rcout-c))
                       riski_matmul()
-                riski_store(Reg.MATMUL_OUTPUT,
+                riski_store(Reg.MATMUL_ACC,
                   SLOT(2) + B*groups*rcout*oy*ox + g*rcout*oy*ox + c*oy*ox + Y*ox + X,
                   1, oy*ox, min(SZ, ox-X), min(SZ, rcout-c))
-    risk_print_counts()
+    cherry_print_counts()
 
     #print(x.shape, w.shape, "->", ret.shape)
-    return riski_dmaw(SLOT(2), (bs, cout, oy, ox))
+    return cherry_dmaw(SLOT(2), (bs, cout, oy, ox))
 
   def backward(ctx, grad_output):
     bs,_,oy,ox = grad_output.shape
@@ -232,19 +264,36 @@ class Conv2D(Function):
     ggg = grad_output.reshape(bs,ctx.groups,rcout,oy,ox)
 
     gdw = np.zeros((ctx.groups,rcout,cin,H,W), dtype=tx.dtype)
-    for g in range(ctx.groups):
-      #'ikYX,ijYXyx -> kjyx'
-      gdw[g] += np.tensordot(ggg[:,g], tx[:,g], ((0,2,3),(0,2,3)))
 
-    # needs to be optimized
+    if cin >= 16:
+      # optimize for large channel count
+      for g in range(ctx.groups):
+        #'ikYX,ijYXyx -> kjyx'
+        for i in range(ggg[:,g].shape[1]):
+          for m in range(tx[:,g].shape[4]):
+            for n in range(tx[:,g].shape[5]):
+              # Use transposes to ensure reshape keeps the correct dimension (channel dimension) when multiple dimensions have the same size
+              big_matrix = np.transpose(tx[:,g][:, :, :, :, m, n], (1, 0, 2, 3)).reshape(tx[:,g].shape[1], -1).T
+              gdw[g][i, :, m, n] = cherry_matmul(ggg[:,g][:,i].reshape(1, -1), big_matrix).flatten()
+    else:
+      # unoptimized
+      for g in range(ctx.groups):
+        #'ikYX,ijYXyx -> kjyx'
+        for i in range(ggg[:,g].shape[1]):
+          for j in range(tx[:,g].shape[1]):
+            for m in range(tx[:,g].shape[4]):
+              big_matrix = tx[:,g][:,j, :, :, m].reshape(-1, tx[:,g].shape[5])
+              gdw[g][i, j, m] = cherry_matmul(ggg[:,g][:,i].reshape(1, -1), big_matrix).flatten()
+
+    # needs to be optimized separately for large oy and ox, versus large ctx.groups
     gdx = np.zeros((bs,ctx.groups,cin,OY,OX), dtype=tx.dtype)
     for k in range(oy*ox):
       Y, X = k//ox, k%ox
       iY,iX = Y*ys, X*xs
-      #gdx[:,:,: , iY:iY+H, iX:iX+W] += np.einsum('igk,gkjyx->igjyx', ggg[:,:,:,Y,X], tw)
+      big_matrix = []
       for g in range(ctx.groups):
-        tg = np.dot(ggg[:,g,:,Y,X].reshape(bs, -1), tw[g].reshape(rcout, -1))
-        gdx[:, g, :, iY:iY+H, iX:iX+W] += tg.reshape((bs, cin, H, W))
+        big_matrix.append(cherry_matmul(ggg[:,g,:,Y,X].reshape(bs, -1), tw[g].reshape(rcout, -1)).reshape((bs, cin, H, W)))
+      gdx[:, :, :, iY:iY+H, iX:iX+W] = cherry_binop(gdx[:, :, :, iY:iY+H, iX:iX+W], np.array(np.transpose(big_matrix, (1, 0, 2, 3, 4))), BinaryOps.ADD)
 
     return gdx.reshape((bs, ctx.groups*cin, OY, OX)), gdw.reshape((ctx.groups*rcout, cin, H, W))
 

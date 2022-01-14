@@ -1,11 +1,12 @@
 from tinygrad.tensor import Tensor
+import tinygrad.nn as nn
 import pickle
 import numpy as np
 
 def fetch(url):
   import requests, os, hashlib, tempfile
   fp = os.path.join(tempfile.gettempdir(), hashlib.md5(url.encode('utf-8')).hexdigest())
-  if os.path.isfile(fp) and os.stat(fp).st_size > 0:
+  if os.path.isfile(fp) and os.stat(fp).st_size > 0 and os.getenv("NOCACHE", None) is None:
     with open(fp, "rb") as f:
       dat = f.read()
   else:
@@ -20,7 +21,7 @@ def get_parameters(obj):
   parameters = []
   if isinstance(obj, Tensor):
     parameters.append(obj)
-  elif isinstance(obj, list):
+  elif isinstance(obj, list) or isinstance(obj, tuple):
     for x in obj:
       parameters.extend(get_parameters(x))
   elif hasattr(obj, '__dict__'):
@@ -107,3 +108,14 @@ def fake_torch_load(b0):
     np_array.strides = real_strides
 
   return ret
+
+def get_child(parent, key):
+  obj = parent
+  for k in key.split('.'):
+    if k.isnumeric():
+      obj = obj[int(k)]
+    elif isinstance(obj, dict):
+      obj = obj[k]
+    else:
+      obj = getattr(obj, k)
+  return obj
