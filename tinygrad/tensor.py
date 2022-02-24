@@ -1,15 +1,21 @@
 # inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
-import inspect
-import functools
-import os
+import os, atexit, time, inspect, functools, importlib
 from collections import defaultdict
 import numpy as np
 
 # **** profiler ****
 
+GRAPH = os.getenv("GRAPH", None) is not None
+if GRAPH:
+  import networkx as nx
+  G = nx.DiGraph()
+  def save_graph_exit():
+    print("saving", G)
+    nx.drawing.nx_pydot.write_dot(G, '/tmp/net.dot')
+  atexit.register(save_graph_exit)
+
 DEBUG = os.getenv("DEBUG", None) is not None
 if DEBUG:
-  import atexit, time
   debug_counts, debug_times = defaultdict(int), defaultdict(float)
   def print_debug_exit():
     for name, _ in sorted(debug_times.items(), key=lambda x: -x[1]):
@@ -17,20 +23,36 @@ if DEBUG:
   atexit.register(print_debug_exit)
 
 class ProfileOp:
-  def __init__(self, name, x, backward=False):
-    self.name, self.x, self.output = f"back_{name}" if backward else name, x, None
+  def __init__(self, ctx, name, x, backward=False):
+    self.ctx, self.name, self.x, self.output, self.backward = ctx, f"back_{name}" if backward else name, x, None, backward
   def __enter__(self):
     if DEBUG: self.st = time.time()
     return self
   def __exit__(self, *junk):
+    if GRAPH:
+      # connect inputs to outputs
+      for x in self.x:
+        for y in self.output:
+          G.add_edge(id(x.data), id(y.data), label=self.name, color="blue" if self.backward else "black")
+          G.nodes[id(x.data)]['label'], G.nodes[id(y.data)]['label'] = str(x.shape), str(y.shape)
+      # which saved tensors does this backward depend on?
+      saved_tensors = filter(lambda x: any([isinstance(x, v) for v in Device.buffers.values()]), self.ctx.saved_tensors)
+      if self.backward:
+        for x in saved_tensors:
+          for y in self.output:
+            G.add_edge(id(x), id(y.data), label=self.name, color="red")
+      # did this forward create any intermediate tensors?
+      if not self.backward:
+        for x in self.x:
+          for y in saved_tensors:
+            if id(x.data) != id(y):
+              G.add_edge(id(x.data), id(y), label=self.name, color="purple")
     if DEBUG:
-      # TODO: fix this
-      #if cl_queue is not None:
-      #  cl_queue.finish()
+      self.output[0].data.toCPU()
       et = (time.time()-self.st)*1000.
       debug_counts[self.name] += 1
       debug_times[self.name] += et
-      print(f"{self.name:>20} : {et:>7.2f} ms {str([y.shape for y in self.x]):>40} {'-> '+str(self.output.shape) if self.output is not None else ''}")
+      print(f"{self.name:>20} : {et:>7.2f} ms {str([y.shape for y in self.x]):>40} -> {str([y.shape for y in self.output])}")
 
 # **** enumerate supported devices ****
 
@@ -49,7 +71,7 @@ class Device:
 
 class Tensor:
   did_float_warning = False
-  training = True
+  training = False
   ops = defaultdict(dict)
 
   def __init__(self, data, device=Device.DEFAULT, requires_grad=True):
@@ -126,17 +148,18 @@ class Tensor:
     self.grad = Tensor(np.ones(self.shape, dtype=self.dtype), device=self.device, requires_grad=False)
 
     for t0 in reversed(self.deepwalk()):
+      if not any([x.requires_grad for x in t0._ctx.parents]):
+        continue
       assert (t0.grad is not None)
-      with ProfileOp(t0._ctx.__class__.__name__, [t0.grad], backward=True) as po:
+      with ProfileOp(t0._ctx, t0._ctx.__class__.__name__, [t0.grad], backward=True) as po:
         grads = t0._ctx.backward(t0._ctx, t0.grad.data)
-      if len(t0._ctx.parents) == 1:
-        grads = [grads]
+        po.output = grads = [Tensor(g, device=self.device, requires_grad=False) if g is not None else None
+          for g in ([grads] if len(t0._ctx.parents) == 1 else grads)]
       for t, g in zip(t0._ctx.parents, grads):
-        if g is not None:
+        if g is not None and t.requires_grad:
           assert g.shape == t.shape, \
             f"grad shape must match tensor shape in {self._ctx!r}, {g.shape!r} != {t.shape!r}"
-          gt = Tensor(g, device=self.device, requires_grad=False)
-          t.grad = gt if t.grad is None else (t.grad + gt)
+          t.grad = g if t.grad is None else (t.grad + g)
 
   # ***** tinygrad supports many devices *****
 
@@ -167,7 +190,7 @@ class Tensor:
     return ret
 
   def detach(self):
-    return Tensor(self.data, device=self.device)
+    return Tensor(self.data, device=self.device, requires_grad=False)
 
   # ***** non first class ops *****
   
@@ -221,12 +244,12 @@ class Tensor:
   def sum(self, axis=None, keepdim=False):
     axis, out_shape = self._canonicalize_reduce_axis(axis)
     ret = self._sum(axis=axis)
-    return ret if keepdim else ret.reshape(shape=out_shape)
+    return ret if keepdim or ret.shape == out_shape else ret.reshape(shape=out_shape)
 
   def max(self, axis=None, keepdim=False):
     axis, out_shape = self._canonicalize_reduce_axis(axis)
     ret = self._max(axis=axis)
-    return ret if keepdim else ret.reshape(shape=out_shape)
+    return ret if keepdim or ret.shape == out_shape else ret.reshape(shape=out_shape)
 
   def mean(self, axis=None, keepdim=False):
     out = self.sum(axis=axis, keepdim=keepdim)
@@ -336,10 +359,12 @@ class Function:
 
   def __init__(self, *tensors):
     self.parents = tensors
+    self.requires_grad = any([t.requires_grad for t in tensors])
     self.saved_tensors = []
 
   def save_for_backward(self, *x):
-    self.saved_tensors.extend(x)
+    if self.requires_grad:
+      self.saved_tensors.extend(x)
 
   def apply(self, *x, **kwargs):
     ctx = self(*x) # self - operation i.e 'add', 'sub', etc.
@@ -351,9 +376,10 @@ class Function:
     # overwrite with passed params
     for k, v in kwargs.items():
       setattr(ctx, k, v)
-    with ProfileOp(ctx.__class__.__name__, x) as po:
-      po.output = ret = Tensor(self.forward(ctx, *[t.data for t in x], **kwargs),
+    with ProfileOp(ctx, ctx.__class__.__name__, x) as po:
+      ret = Tensor(self.forward(ctx, *[t.data for t in x], **kwargs),
                    device=ctx.device, requires_grad=any([t.requires_grad for t in x]))
+      po.output = [ret]
     if ret.requires_grad:
       ret._ctx = ctx
     return ret
@@ -364,7 +390,6 @@ def register(name, fxn, device=Device.CPU):
     tt = [arg for arg in x if isinstance(arg, Tensor)][0]
     x = [Tensor(np.array([arg], dtype=tt.dtype), device=tt.device, requires_grad=False) if not isinstance(arg, Tensor) else arg for arg in x]
     f = Tensor.ops[tt.device][name]
-    #f.cl_ctx, f.cl_queue, f.device = cl_ctx, cl_queue, tt.device
     f.device = tt.device
     return f.apply(f, *x, **kwargs)
   if getattr(Tensor, name, None) is not None:
@@ -386,7 +411,6 @@ def _register_ops(namespace, device=Device.CPU):
     if name.endswith("Buffer"):  Device.buffers[device] = cls
     elif name[0] != "_":  register(name.lower(), cls, device=device)
 
-import importlib
 for d,ops in Device.imports.items():
   try:
     _register_ops(importlib.import_module('tinygrad.ops.'+ops), d)
